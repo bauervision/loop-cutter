@@ -1,0 +1,13 @@
+{
+  "hosting": {
+    "site": "loop-cutter",
+    "public": "out",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "headers": [
+      {
+        "source": "**/*.@(wav|mp3|ogg)",
+        "headers": [{ "key": "Cache-Control", "value": "public,max-age=3600" }]
+      }
+    ]
+  }
+}

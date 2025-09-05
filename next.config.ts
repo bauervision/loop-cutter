@@ -1,7 +1,7 @@
-import type { NextConfig } from "next";
-
-const nextConfig: NextConfig = {
-  /* config options here */
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  output: "export", // ← this replaces `next export`
+  images: { unoptimized: true },
+  eslint: { ignoreDuringBuilds: true }, // optional: don't block builds on lint
 };
-
-export default nextConfig;
+module.exports = nextConfig;
