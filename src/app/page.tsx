@@ -3,7 +3,7 @@
 import * as React from "react";
 
 /* ---------- Minimal types ---------- */
-type WaveSurferType = typeof import("wavesurfer.js")["default"];
+type WaveSurferType = (typeof import("wavesurfer.js"))["default"];
 type WaveSurferInstance = InstanceType<WaveSurferType>;
 interface RegionInstance {
   id: string;
@@ -18,7 +18,7 @@ interface RegionInstance {
       drag: boolean;
       resize: boolean;
       loop: boolean;
-    }>
+    }>,
   ) => void;
   remove?: () => void;
 }
@@ -59,6 +59,25 @@ export default function Page() {
   // Selection
   const [start, setStart] = React.useState(0);
   const [end, setEnd] = React.useState(2);
+
+  // Cut / Undo history (stores the buffer + region prior to a destructive edit)
+  const historyRef = React.useRef<
+    { buffer: AudioBuffer; start: number; end: number }[]
+  >([]);
+  const [canUndo, setCanUndo] = React.useState(false);
+  const [isEditing, setIsEditing] = React.useState(false);
+  // When set, the next 'ready' event restores this region instead of the default
+  const preserveRegionRef = React.useRef<{ start: number; end: number } | null>(
+    null,
+  );
+
+  // Fade in/out (seconds, measured from the clip start and end)
+  const [fadeInSec, setFadeInSec] = React.useState(0);
+  const [fadeOutSec, setFadeOutSec] = React.useState(0);
+  const fadeInSecRef = React.useRef(fadeInSec);
+  const fadeOutSecRef = React.useRef(fadeOutSec);
+  const fadeInHandleRef = React.useRef<HTMLDivElement | null>(null);
+  const fadeOutHandleRef = React.useRef<HTMLDivElement | null>(null);
 
   // Grid + snap
   const [showGrid, setShowGrid] = React.useState(false); // default OFF
@@ -123,6 +142,14 @@ export default function Page() {
   React.useEffect(() => {
     showGridRef.current = showGrid;
   }, [showGrid]);
+  React.useEffect(() => {
+    fadeInSecRef.current = fadeInSec;
+    drawGrid();
+  }, [fadeInSec]);
+  React.useEffect(() => {
+    fadeOutSecRef.current = fadeOutSec;
+    drawGrid();
+  }, [fadeOutSec]);
 
   /* -------- loop freeze helpers -------- */
   const frozenScrollRef = React.useRef<number | null>(null);
@@ -218,19 +245,26 @@ export default function Page() {
       wsRef.current = ws;
 
       const regions = ws.registerPlugin(
-        RegionsPlugin.create()
+        RegionsPlugin.create(),
       ) as RegionsPluginInstance;
       regionsRef.current = regions;
       regions.enableDragSelection({ slop: 2, color: "rgba(76,143,247,0.18)" });
 
       ws.on("ready", () => {
         ws.zoom(zoomRef.current);
-        drawGrid();
         regions.clearRegions();
         const dur = ws.getDuration() || 2;
+        const preserved = preserveRegionRef.current;
+        preserveRegionRef.current = null;
+        let rs = 0;
+        let re = Math.min(2, dur);
+        if (preserved) {
+          rs = clamp(preserved.start, 0, dur);
+          re = clamp(preserved.end, rs + 0.0005, dur);
+        }
         const r = regions.addRegion({
-          start: 0,
-          end: Math.min(2, dur),
+          start: rs,
+          end: re,
           color: "rgba(76,143,247,0.18)",
           drag: true,
           resize: true,
@@ -239,6 +273,7 @@ export default function Page() {
         regionRef.current = r;
         setStart(r.start);
         setEnd(r.end);
+        drawGrid();
       });
 
       ws.on("timeupdate", () => {
@@ -324,6 +359,11 @@ export default function Page() {
   const onFile = async (file: File) => {
     setLoadedName(file.name);
     originalBlobRef.current = file;
+    historyRef.current = [];
+    setCanUndo(false);
+    setFadeInSec(0);
+    setFadeOutSec(0);
+    preserveRegionRef.current = null;
     if (!wsRef.current) return;
 
     try {
@@ -333,8 +373,9 @@ export default function Page() {
     }
 
     if (!audioCtxRef.current)
-      audioCtxRef.current = new (window.AudioContext ||
-        (window as any).webkitAudioContext)();
+      audioCtxRef.current = new (
+        window.AudioContext || (window as any).webkitAudioContext
+      )();
     const buf = await file.arrayBuffer();
     bufferRef.current = await audioCtxRef.current.decodeAudioData(buf.slice(0));
   };
@@ -411,7 +452,7 @@ export default function Page() {
     const target = t * pxPerSec - wrapper.clientWidth / 2;
     wrapper.scrollLeft = Math.max(
       0,
-      Math.min(target, totalPx - wrapper.clientWidth)
+      Math.min(target, totalPx - wrapper.clientWidth),
     );
     drawGrid();
   };
@@ -444,12 +485,137 @@ export default function Page() {
     });
   };
 
+  /* -------- Cut / Undo -------- */
+  const loadBufferIntoWaveSurfer = async (buf: AudioBuffer) => {
+    const ws = wsRef.current;
+    if (!ws) return;
+    const wav = encodeWAV(buf);
+    const blob = new Blob([wav], { type: "audio/wav" });
+    originalBlobRef.current = blob;
+    await ws.loadBlob(blob);
+  };
+
+  const cutSelection = async () => {
+    const r = regionRef.current,
+      buf = bufferRef.current,
+      ws = wsRef.current;
+    if (!r || !buf || !ws || isEditing) return;
+    const sr = buf.sampleRate;
+    const sStart = Math.max(0, Math.min(buf.length, Math.round(r.start * sr)));
+    const sEnd = Math.max(sStart, Math.min(buf.length, Math.round(r.end * sr)));
+    if (sEnd - sStart < 1) return;
+
+    setIsEditing(true);
+    try {
+      historyRef.current.push({ buffer: buf, start: r.start, end: r.end });
+      setCanUndo(true);
+
+      const newLength = Math.max(1, buf.length - (sEnd - sStart));
+      const newBuf = new AudioBuffer({
+        length: newLength,
+        numberOfChannels: buf.numberOfChannels,
+        sampleRate: sr,
+      });
+      for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+        const src = buf.getChannelData(ch),
+          dst = newBuf.getChannelData(ch);
+        dst.set(src.subarray(0, sStart), 0);
+        dst.set(src.subarray(sEnd), sStart);
+      }
+      bufferRef.current = newBuf;
+
+      const newDur = newBuf.duration;
+      let rs = Math.min(r.start, newDur);
+      let re = Math.min(newDur, rs + 0.05);
+      if (re <= rs) {
+        rs = Math.max(0, newDur - 0.05);
+        re = newDur;
+      }
+      preserveRegionRef.current = { start: rs, end: re };
+
+      await loadBufferIntoWaveSurfer(newBuf);
+    } finally {
+      setIsEditing(false);
+    }
+  };
+
+  const undoLastEdit = async () => {
+    const ws = wsRef.current;
+    if (!ws || isEditing) return;
+    const entry = historyRef.current.pop();
+    if (!entry) return;
+
+    setIsEditing(true);
+    try {
+      bufferRef.current = entry.buffer;
+      preserveRegionRef.current = { start: entry.start, end: entry.end };
+      await loadBufferIntoWaveSurfer(entry.buffer);
+    } finally {
+      setIsEditing(false);
+      setCanUndo(historyRef.current.length > 0);
+    }
+  };
+
+  /* -------- Fade in/out -------- */
+  const nudgeFadeIn = (ms: number) => {
+    const dur =
+      wsRef.current?.getDuration() ?? bufferRef.current?.duration ?? 0;
+    setFadeInSec((prev) =>
+      clamp(prev + ms / 1000, 0, Math.max(0, dur - fadeOutSecRef.current)),
+    );
+  };
+  const nudgeFadeOut = (ms: number) => {
+    const dur =
+      wsRef.current?.getDuration() ?? bufferRef.current?.duration ?? 0;
+    setFadeOutSec((prev) =>
+      clamp(prev + ms / 1000, 0, Math.max(0, dur - fadeInSecRef.current)),
+    );
+  };
+  const clearFades = () => {
+    setFadeInSec(0);
+    setFadeOutSec(0);
+  };
+
+  const startFadeDrag =
+    (which: "in" | "out") => (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const handle = e.currentTarget;
+      handle.setPointerCapture(e.pointerId);
+
+      const onMove = (ev: PointerEvent) => {
+        const layout = computeLayout();
+        if (!layout) return;
+        const rect = layout.wrapper.getBoundingClientRect();
+        const x = ev.clientX - rect.left + layout.scrollLeft;
+        const t = clamp(layout.pxToSec(x), 0, layout.duration);
+        if (which === "in") {
+          const maxIn = Math.max(0, layout.duration - fadeOutSecRef.current);
+          setFadeInSec(clamp(t, 0, maxIn));
+        } else {
+          const maxOut = Math.max(0, layout.duration - fadeInSecRef.current);
+          setFadeOutSec(clamp(layout.duration - t, 0, maxOut));
+        }
+      };
+      const onUp = (ev: PointerEvent) => {
+        handle.releasePointerCapture(ev.pointerId);
+        handle.removeEventListener("pointermove", onMove);
+        handle.removeEventListener("pointerup", onUp);
+      };
+      handle.addEventListener("pointermove", onMove);
+      handle.addEventListener("pointerup", onUp);
+    };
+
   /* -------- Export (with Clean FX) -------- */
   const exportSelection = async () => {
     const r = regionRef.current,
       buf = bufferRef.current;
     if (!r || !buf) return;
-    const sliced = sliceBuffer(buf, r.start, r.end, {
+    const faded =
+      fadeInSec > 0 || fadeOutSec > 0
+        ? applyFades(buf, fadeInSec, fadeOutSec)
+        : buf;
+    const sliced = sliceBuffer(faded, r.start, r.end, {
       zeroCross,
       edgeFadeMs: edgeFade ? 8 : 0,
     });
@@ -481,25 +647,32 @@ export default function Page() {
     const tNow = ws.getCurrentTime();
     const r = regionRef.current;
 
-    const allOff = !fxHighpass && !fxHum && !fxLowpass && !fxGate && !fxLimiter;
+    const anyFxOn = fxHighpass || fxHum || fxLowpass || fxGate || fxLimiter;
+    const anyFadeOn = fadeInSec > 0 || fadeOutSec > 0;
+    const allOff = !anyFxOn && !anyFadeOn;
 
     const id = setTimeout(async () => {
       if (cancelled || !bufferRef.current || !wsRef.current) return;
 
       setIsRenderingFX(true);
       try {
+        if (r) preserveRegionRef.current = { start: r.start, end: r.end };
         if (allOff) {
           if (originalBlobRef.current)
             await ws.loadBlob(originalBlobRef.current);
         } else {
-          const processed = await renderWithFX(bufferRef.current!, {
-            hp: fxHighpass,
-            hum: fxHum,
-            humHz: fxHumFreq,
-            lp: fxLowpass,
-            gate: fxGate,
-            limiter: fxLimiter,
-          });
+          let working = bufferRef.current!;
+          if (anyFadeOn) working = applyFades(working, fadeInSec, fadeOutSec);
+          const processed = anyFxOn
+            ? await renderWithFX(working, {
+                hp: fxHighpass,
+                hum: fxHum,
+                humHz: fxHumFreq,
+                lp: fxLowpass,
+                gate: fxGate,
+                limiter: fxLimiter,
+              })
+            : working;
           const wav = encodeWAV(processed);
           const blob = new Blob([wav], { type: "audio/wav" });
           await ws.loadBlob(blob);
@@ -509,7 +682,7 @@ export default function Page() {
           wasLooping && r
             ? Math.min(
                 Math.max(r.start, tNow),
-                Math.max(r.start, r.end - 0.001)
+                Math.max(r.start, r.end - 0.001),
               )
             : tNow;
         ws.setTime(resumeTime);
@@ -525,41 +698,29 @@ export default function Page() {
       clearTimeout(id);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fxHighpass, fxHum, fxHumFreq, fxLowpass, fxGate, fxLimiter]);
+  }, [
+    fxHighpass,
+    fxHum,
+    fxHumFreq,
+    fxLowpass,
+    fxGate,
+    fxLimiter,
+    fadeInSec,
+    fadeOutSec,
+  ]);
 
-  /* -------- Grid overlay -------- */
-  const clearGrid = () => {
-    const canvas = overlayRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-  };
-
-  const drawGrid = React.useCallback(() => {
-    if (!showGridRef.current) return;
-
+  /* -------- Grid + fade overlay -------- */
+  function computeLayout() {
     const ws = wsRef.current,
       canvas = overlayRef.current;
-    if (!ws || !canvas) return;
+    if (!ws || !canvas) return null;
     const renderer: any = (ws as any).renderer;
     const wrapper: HTMLElement | undefined =
       renderer?.getWrapper?.() || (ws as any).getWrapper?.();
     const duration = ws.getDuration() || 0;
-    if (!wrapper || !duration) return;
-
+    if (!wrapper || !duration) return null;
     const w = wrapper.clientWidth,
       h = wrapper.clientHeight;
-    canvas.width = Math.max(1, Math.floor(w * devicePixelRatio));
-    canvas.height = Math.max(1, Math.floor(h * devicePixelRatio));
-    canvas.style.width = `${w}px`;
-    canvas.style.height = `${h}px`;
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-
     const totalPx: number =
       (renderer?.getWidth && renderer.getWidth()) || wrapper.scrollWidth || w;
     const secToPx = (t: number) =>
@@ -570,14 +731,88 @@ export default function Page() {
       renderer?.pixelsToSeconds
         ? renderer.pixelsToSeconds(x)
         : (x * duration) / totalPx;
-
     const scrollLeft = wrapper.scrollLeft || 0;
-    const visStart = pxToSec(scrollLeft);
-    const visEnd = pxToSec(scrollLeft + w);
+    return {
+      ws,
+      wrapper,
+      duration,
+      w,
+      h,
+      totalPx,
+      secToPx,
+      pxToSec,
+      scrollLeft,
+    };
+  }
+
+  const drawGrid = React.useCallback(() => {
+    const layout = computeLayout();
+    const canvas = overlayRef.current;
+    if (!layout || !canvas) return;
+    const { duration, w, h, secToPx, pxToSec, scrollLeft } = layout;
+
+    canvas.width = Math.max(1, Math.floor(w * devicePixelRatio));
+    canvas.height = Math.max(1, Math.floor(h * devicePixelRatio));
+    canvas.style.width = `${w}px`;
+    canvas.style.height = `${h}px`;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    // Fade-in / fade-out shading — always visible, independent of the grid
+    const fadeIn = fadeInSecRef.current;
+    const fadeOut = fadeOutSecRef.current;
+    if (fadeIn > 1e-4) {
+      const x0 = -scrollLeft;
+      const x1 = secToPx(fadeIn) - scrollLeft;
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      ctx.beginPath();
+      ctx.moveTo(x0, 0);
+      ctx.lineTo(x1, 0);
+      ctx.lineTo(x0, h);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "#ffd166";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x0, h);
+      ctx.lineTo(x1, 0);
+      ctx.stroke();
+    }
+    if (fadeOut > 1e-4) {
+      const xEnd = secToPx(duration) - scrollLeft;
+      const xStart = secToPx(duration - fadeOut) - scrollLeft;
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      ctx.beginPath();
+      ctx.moveTo(xEnd, 0);
+      ctx.lineTo(xStart, 0);
+      ctx.lineTo(xEnd, h);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "#ffd166";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(xStart, 0);
+      ctx.lineTo(xEnd, h);
+      ctx.stroke();
+    }
+
+    if (fadeInHandleRef.current)
+      fadeInHandleRef.current.style.left = `${secToPx(fadeIn) - scrollLeft}px`;
+    if (fadeOutHandleRef.current)
+      fadeOutHandleRef.current.style.left = `${
+        secToPx(duration - fadeOut) - scrollLeft
+      }px`;
+
+    if (!showGridRef.current) return;
 
     const r = regionRef.current;
     if (!r) return;
 
+    const visStart = pxToSec(scrollLeft);
+    const visEnd = pxToSec(scrollLeft + w);
     const tStart = Math.max(visStart, r.start);
     const tEnd = Math.min(visEnd, r.end);
     if (tEnd - tStart <= 1e-4) return;
@@ -587,12 +822,12 @@ export default function Page() {
       subdiv === "bar"
         ? beat * 4
         : subdiv === "beat"
-        ? beat
-        : subdiv === "eighth"
-        ? beat / 2
-        : beat / 4;
+          ? beat
+          : subdiv === "eighth"
+            ? beat / 2
+            : beat / 4;
 
-    const pxPerSec = totalPx / duration;
+    const pxPerSec = layout.totalPx / duration;
     const targetPx = 40;
     let step = baseStep;
     while (pxPerSec * step < targetPx * 0.7) step *= 2;
@@ -611,7 +846,7 @@ export default function Page() {
       const x = Math.round(secToPx(t) - scrollLeft) + 0.5;
       const isBar =
         Math.abs(
-          (t - anchor) / barPeriod - Math.round((t - anchor) / barPeriod)
+          (t - anchor) / barPeriod - Math.round((t - anchor) / barPeriod),
         ) < 1e-6;
 
       ctx.strokeStyle = isBar
@@ -628,8 +863,7 @@ export default function Page() {
   }, [bpm, subdiv]);
 
   React.useEffect(() => {
-    if (!showGrid) clearGrid();
-    else drawGrid();
+    drawGrid();
   }, [showGrid, drawGrid]);
   React.useEffect(() => {
     drawGrid();
@@ -666,11 +900,17 @@ export default function Page() {
       } else if (e.key === "}") {
         e.preventDefault();
         nudgeEnd(+1);
+      } else if (e.key === "Delete" || e.key === "Backspace") {
+        e.preventDefault();
+        cutSelection();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        undoLastEdit();
       }
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [togglePlayPause, toggleLoop, returnToStart]);
+  }, [togglePlayPause, toggleLoop, returnToStart, cutSelection, undoLastEdit]);
 
   /* -------- Mouse wheel zoom (cursor-anchored) -------- */
   const onWheelZoom = (e: React.WheelEvent) => {
@@ -702,7 +942,7 @@ export default function Page() {
       wrapper.scrollLeft = clamp(
         newScrollLeft,
         0,
-        Math.max(0, totalPxAfter - wrapper.clientWidth)
+        Math.max(0, totalPxAfter - wrapper.clientWidth),
       );
       updateLoopFreeze();
       drawGrid();
@@ -726,7 +966,9 @@ export default function Page() {
             <h1 style={styles.title}>Loop Cutter</h1>
             <p style={styles.subtitle}>
               Draw a region by dragging. Play to audition, Play Loop for a
-              gapless loop. Export clean, click-free WAVs.
+              gapless loop. Press Delete to cut the selection (Ctrl+Z to undo).
+              Drag the amber handles on the waveform edges to shape fade in/out.
+              Export clean, click-free WAVs.
               {isRenderingFX && (
                 <em style={{ marginLeft: 8, opacity: 0.7, fontSize: 12 }}>
                   (rendering preview…)
@@ -764,6 +1006,22 @@ export default function Page() {
               display: "block",
             }}
           />
+          <div
+            ref={fadeInHandleRef}
+            style={styles.fadeHandle}
+            onPointerDown={startFadeDrag("in")}
+            title="Drag to set fade-in length"
+          >
+            <div style={styles.fadeHandleGrip} />
+          </div>
+          <div
+            ref={fadeOutHandleRef}
+            style={styles.fadeHandle}
+            onPointerDown={startFadeDrag("out")}
+            title="Drag to set fade-out length"
+          >
+            <div style={styles.fadeHandleGrip} />
+          </div>
         </div>
 
         <section style={styles.controls}>
@@ -815,6 +1073,22 @@ export default function Page() {
                 disabled={!regionRef.current || !bufferRef.current}
               >
                 Export WAV (Clean)
+              </button>
+
+              <button
+                style={styles.ghost}
+                onClick={cutSelection}
+                disabled={!regionRef.current || !bufferRef.current || isEditing}
+              >
+                ✂ Cut Selection (Del)
+              </button>
+
+              <button
+                style={styles.ghost}
+                onClick={undoLastEdit}
+                disabled={!canUndo || isEditing}
+              >
+                ↩ Undo (Ctrl+Z)
               </button>
             </div>
           </div>
@@ -1027,6 +1301,55 @@ export default function Page() {
               <span>Edge fades (export)</span>
             </label>
           </div>
+
+          {/* Fade in/out */}
+          <div style={{ ...styles.row, marginTop: 10 }}>
+            <div style={styles.nudgeCol}>
+              <div style={styles.nudgeLabel}>Fade In</div>
+              <div style={styles.nudges}>
+                <button style={styles.chip} onClick={() => nudgeFadeIn(-100)}>
+                  −100 ms
+                </button>
+                <button style={styles.chip} onClick={() => nudgeFadeIn(-10)}>
+                  −10 ms
+                </button>
+                <button style={styles.chip} onClick={() => nudgeFadeIn(+10)}>
+                  +10 ms
+                </button>
+                <button style={styles.chip} onClick={() => nudgeFadeIn(+100)}>
+                  +100 ms
+                </button>
+              </div>
+            </div>
+            <div style={styles.nudgeCol}>
+              <div style={styles.nudgeLabel}>Fade Out</div>
+              <div style={styles.nudges}>
+                <button style={styles.chip} onClick={() => nudgeFadeOut(-100)}>
+                  −100 ms
+                </button>
+                <button style={styles.chip} onClick={() => nudgeFadeOut(-10)}>
+                  −10 ms
+                </button>
+                <button style={styles.chip} onClick={() => nudgeFadeOut(+10)}>
+                  +10 ms
+                </button>
+                <button style={styles.chip} onClick={() => nudgeFadeOut(+100)}>
+                  +100 ms
+                </button>
+              </div>
+            </div>
+            <button
+              style={styles.ghost}
+              onClick={clearFades}
+              disabled={fadeInSec === 0 && fadeOutSec === 0}
+            >
+              Clear fades
+            </button>
+            <div style={styles.meta}>
+              Fade in <strong>{fmt(fadeInSec)}</strong> · Fade out{" "}
+              <strong>{fmt(fadeOutSec)}</strong>
+            </div>
+          </div>
         </section>
       </div>
     </main>
@@ -1165,6 +1488,27 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
   },
   meta: { marginLeft: "auto", fontSize: 12, opacity: 0.85 },
+  fadeHandle: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    width: 0,
+    borderLeft: "2px dashed #ffd166",
+    cursor: "ew-resize",
+    zIndex: 5,
+    touchAction: "none",
+  },
+  fadeHandleGrip: {
+    position: "absolute",
+    top: -2,
+    left: -8,
+    width: 16,
+    height: 16,
+    borderRadius: "50%",
+    background: "#ffd166",
+    border: "2px solid #0b1220",
+    cursor: "ew-resize",
+  },
 };
 
 /* ---------- Utils ---------- */
@@ -1186,7 +1530,7 @@ function sliceBuffer(
   buffer: AudioBuffer,
   startSec: number,
   endSec: number,
-  opts: { zeroCross: boolean; edgeFadeMs: number }
+  opts: { zeroCross: boolean; edgeFadeMs: number },
 ): AudioBuffer {
   const { zeroCross, edgeFadeMs } = opts;
   const sr = buffer.sampleRate;
@@ -1226,7 +1570,7 @@ function snapToZeroCross(
   buffer: AudioBuffer,
   frame: number,
   search: number,
-  dir: -1 | 1
+  dir: -1 | 1,
 ): number {
   const ch0 = buffer.getChannelData(0);
   const start = Math.max(1, frame - (dir < 0 ? search : 0));
@@ -1246,6 +1590,37 @@ function snapToZeroCross(
   return best;
 }
 
+/* Apply linear fade-in/out ramps (seconds) across the whole buffer */
+function applyFades(
+  buffer: AudioBuffer,
+  fadeInSec: number,
+  fadeOutSec: number,
+): AudioBuffer {
+  if (fadeInSec <= 0 && fadeOutSec <= 0) return buffer;
+  const sr = buffer.sampleRate;
+  const len = buffer.length;
+  const fadeInFrames = Math.min(len, Math.round(fadeInSec * sr));
+  const fadeOutFrames = Math.min(len, Math.round(fadeOutSec * sr));
+  const out = new AudioBuffer({
+    length: len,
+    numberOfChannels: buffer.numberOfChannels,
+    sampleRate: sr,
+  });
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    const src = buffer.getChannelData(ch),
+      dst = out.getChannelData(ch);
+    dst.set(src);
+    for (let i = 0; i < fadeInFrames; i++) {
+      dst[i] *= i / fadeInFrames;
+    }
+    for (let i = 0; i < fadeOutFrames; i++) {
+      const idx = len - 1 - i;
+      dst[idx] *= i / fadeOutFrames;
+    }
+  }
+  return out;
+}
+
 /* Offline render with Clean FX (HPF, hum notch, LPF, gate, limiter) */
 async function renderWithFX(
   buffer: AudioBuffer,
@@ -1256,7 +1631,7 @@ async function renderWithFX(
     lp: boolean;
     gate: boolean;
     limiter: boolean;
-  }
+  },
 ): Promise<AudioBuffer> {
   const numCh = buffer.numberOfChannels;
   const sr = buffer.sampleRate;
@@ -1382,7 +1757,7 @@ function writeStr(view: DataView, offset: number, str: string) {
 /* ---------- BPM detector (envelope autocorrelation) ---------- */
 async function detectBPM(
   buffer: AudioBuffer,
-  opts: { minBPM: number; maxBPM: number }
+  opts: { minBPM: number; maxBPM: number },
 ): Promise<{ bpm: number; phaseSec: number; confidence: number }> {
   const sr = buffer.sampleRate;
   const nCh = buffer.numberOfChannels;
@@ -1420,10 +1795,10 @@ async function detectBPM(
   for (let i = 0; i < env.length; i++) env[i] /= mx;
 
   const minLag = Math.round(
-    60 / Math.min(220, Math.max(40, opts.maxBPM)) / hopSec
+    60 / Math.min(220, Math.max(40, opts.maxBPM)) / hopSec,
   );
   const maxLag = Math.round(
-    60 / Math.max(40, Math.min(220, opts.minBPM)) / hopSec
+    60 / Math.max(40, Math.min(220, opts.minBPM)) / hopSec,
   );
 
   let bestLag = -1,
