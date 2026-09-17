@@ -39,6 +39,9 @@ interface RegionsPluginInstance {
 
 type Subdiv = "bar" | "beat" | "eighth" | "sixteenth";
 
+// Keeps the fade-handle hit target fully inside the overflow:hidden wave area
+const HANDLE_EDGE_PAD = 10;
+
 export default function Page() {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const overlayRef = React.useRef<HTMLCanvasElement | null>(null);
@@ -101,6 +104,11 @@ export default function Page() {
   const [zeroCross, setZeroCross] = React.useState(true);
   const [edgeFade, setEdgeFade] = React.useState(true);
 
+  // Bottom panel tabs (BPM / FADE / FILTER / TRIM)
+  const [activeTab, setActiveTab] = React.useState<
+    "bpm" | "fade" | "filter" | "trim"
+  >("bpm");
+
   // Clean FX (all OFF by default)
   const [fxHighpass, setFxHighpass] = React.useState(false);
   const [fxHum, setFxHum] = React.useState(false);
@@ -155,27 +163,14 @@ export default function Page() {
   const frozenScrollRef = React.useRef<number | null>(null);
   const prevAutoCenterRef = React.useRef<boolean | null>(null);
 
-  function getWrapperAndRenderer() {
-    const ws = wsRef.current as any;
-    const renderer: any = ws?.renderer;
-    const wrapper: HTMLElement | undefined =
-      renderer?.getWrapper?.() || ws?.getWrapper?.();
-    return { ws, renderer, wrapper };
-  }
   function isRegionFullyVisible(padPx = 2): boolean {
-    const { ws, renderer, wrapper } = getWrapperAndRenderer();
+    const layout = computeLayout();
     const r = regionRef.current;
-    if (!ws || !wrapper || !r) return false;
-    const duration = ws.getDuration() || 0;
-    if (!duration) return false;
+    if (!layout || !r) return false;
 
-    const totalPx =
-      renderer?.getWidth?.() || wrapper.scrollWidth || wrapper.clientWidth;
-    const pxPerSec = totalPx / duration;
-
-    const visStart = (wrapper.scrollLeft + padPx) / pxPerSec;
-    const visEnd =
-      (wrapper.scrollLeft + wrapper.clientWidth - padPx) / pxPerSec;
+    const pxPerSec = layout.totalPx / layout.duration;
+    const visStart = (layout.scrollLeft + padPx) / pxPerSec;
+    const visEnd = (layout.scrollLeft + layout.w - padPx) / pxPerSec;
     return r.start >= visStart && r.end <= visEnd;
   }
   function setAutoCenter(enabled: boolean) {
@@ -186,10 +181,10 @@ export default function Page() {
   }
   function updateLoopFreeze() {
     const shouldFreeze = loopModeRef.current && isRegionFullyVisible();
-    const { wrapper } = getWrapperAndRenderer();
-    if (!wrapper) return;
+    const layout = computeLayout();
+    if (!layout) return;
     if (shouldFreeze) {
-      frozenScrollRef.current = wrapper.scrollLeft;
+      frozenScrollRef.current = layout.scrollLeft;
       setAutoCenter(false);
     } else {
       frozenScrollRef.current = null;
@@ -277,10 +272,10 @@ export default function Page() {
       });
 
       ws.on("timeupdate", () => {
-        const { wrapper } = getWrapperAndRenderer();
-        if (!wrapper) return;
+        const renderer: any = (ws as any).renderer;
+        if (!renderer) return;
         if (loopModeRef.current && frozenScrollRef.current !== null) {
-          wrapper.scrollLeft = frozenScrollRef.current!;
+          renderer.setScroll?.(frozenScrollRef.current!);
         }
       });
 
@@ -438,22 +433,12 @@ export default function Page() {
   const centerOnPlayhead = () => {
     const ws = wsRef.current as any;
     if (!ws) return;
-    const renderer: any = ws.renderer;
-    const wrapper: HTMLElement | undefined =
-      renderer?.getWrapper?.() || ws.getWrapper?.();
-    const duration = ws.getDuration() || 0;
-    if (!wrapper || !duration) return;
-    const totalPx: number =
-      (renderer?.getWidth && renderer.getWidth()) ||
-      wrapper.scrollWidth ||
-      wrapper.clientWidth;
-    const pxPerSec = totalPx / duration;
+    const layout = computeLayout();
+    if (!layout) return;
     const t = ws.getCurrentTime() as number;
-    const target = t * pxPerSec - wrapper.clientWidth / 2;
-    wrapper.scrollLeft = Math.max(
-      0,
-      Math.min(target, totalPx - wrapper.clientWidth),
-    );
+    const target = layout.secToPx(t) - layout.w / 2;
+    const clamped = Math.max(0, Math.min(target, layout.totalPx - layout.w));
+    (ws.renderer as any)?.setScroll?.(clamped);
     drawGrid();
   };
 
@@ -580,14 +565,21 @@ export default function Page() {
     (which: "in" | "out") => (e: React.PointerEvent<HTMLDivElement>) => {
       e.preventDefault();
       e.stopPropagation();
-      const handle = e.currentTarget;
-      handle.setPointerCapture(e.pointerId);
+      const pointerId = e.pointerId;
 
+      // Listen on window (not the handle element) and self-heal if the
+      // button is released without us seeing pointerup, so a drag can never
+      // get "stuck" and keep reacting to mouse moves elsewhere on the page.
       const onMove = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return;
+        if (ev.buttons === 0) {
+          stop();
+          return;
+        }
         const layout = computeLayout();
         if (!layout) return;
         const rect = layout.wrapper.getBoundingClientRect();
-        const x = ev.clientX - rect.left + layout.scrollLeft;
+        const x = ev.clientX - rect.left;
         const t = clamp(layout.pxToSec(x), 0, layout.duration);
         if (which === "in") {
           const maxIn = Math.max(0, layout.duration - fadeOutSecRef.current);
@@ -597,26 +589,33 @@ export default function Page() {
           setFadeOutSec(clamp(layout.duration - t, 0, maxOut));
         }
       };
-      const onUp = (ev: PointerEvent) => {
-        handle.releasePointerCapture(ev.pointerId);
-        handle.removeEventListener("pointermove", onMove);
-        handle.removeEventListener("pointerup", onUp);
+      const stop = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", stop);
+        window.removeEventListener("pointercancel", stop);
+        window.removeEventListener("blur", stop);
       };
-      handle.addEventListener("pointermove", onMove);
-      handle.addEventListener("pointerup", onUp);
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", stop);
+      window.addEventListener("pointercancel", stop);
+      window.addEventListener("blur", stop);
     };
 
   /* -------- Export (with Clean FX) -------- */
-  const exportSelection = async () => {
-    const r = regionRef.current,
-      buf = bufferRef.current;
-    if (!r || !buf) return;
+  const exportRange = async (
+    startSec: number,
+    endSec: number,
+    useZeroCross: boolean,
+    label: string,
+  ) => {
+    const buf = bufferRef.current;
+    if (!buf) return;
     const faded =
       fadeInSec > 0 || fadeOutSec > 0
         ? applyFades(buf, fadeInSec, fadeOutSec)
         : buf;
-    const sliced = sliceBuffer(faded, r.start, r.end, {
-      zeroCross,
+    const sliced = sliceBuffer(faded, startSec, endSec, {
+      zeroCross: useZeroCross,
       edgeFadeMs: edgeFade ? 8 : 0,
     });
     const cleaned = await renderWithFX(sliced, {
@@ -632,8 +631,25 @@ export default function Page() {
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     const base = (loadedName || "loop").replace(/\.[^.]+$/, "");
-    a.download = `${base}_${fmt(r.start)}-${fmt(r.end)}_clean.wav`;
+    a.download = `${base}_${label}_clean.wav`;
     a.click();
+  };
+
+  const exportSelection = async () => {
+    const r = regionRef.current;
+    if (!r || !bufferRef.current) return;
+    await exportRange(
+      r.start,
+      r.end,
+      zeroCross,
+      `${fmt(r.start)}-${fmt(r.end)}`,
+    );
+  };
+
+  const exportAll = async () => {
+    const buf = bufferRef.current;
+    if (!buf) return;
+    await exportRange(0, buf.duration, false, "full");
   };
 
   /* -------- Auto-preview filters during playback/loop -------- */
@@ -715,23 +731,22 @@ export default function Page() {
       canvas = overlayRef.current;
     if (!ws || !canvas) return null;
     const renderer: any = (ws as any).renderer;
+    // `wrapper` is WaveSurfer's full (unclipped) content element — its own
+    // clientWidth is the TOTAL zoomed width, not the visible viewport width.
     const wrapper: HTMLElement | undefined =
       renderer?.getWrapper?.() || (ws as any).getWrapper?.();
     const duration = ws.getDuration() || 0;
     if (!wrapper || !duration) return null;
-    const w = wrapper.clientWidth,
-      h = wrapper.clientHeight;
-    const totalPx: number =
-      (renderer?.getWidth && renderer.getWidth()) || wrapper.scrollWidth || w;
-    const secToPx = (t: number) =>
-      renderer?.secondsToPixels
-        ? renderer.secondsToPixels(t)
-        : (t * totalPx) / duration;
-    const pxToSec = (x: number) =>
-      renderer?.pixelsToSeconds
-        ? renderer.pixelsToSeconds(x)
-        : (x * duration) / totalPx;
-    const scrollLeft = wrapper.scrollLeft || 0;
+    // Visible viewport width/scroll come from the renderer's scroll APIs,
+    // not from `wrapper` (which has no scrollbox of its own).
+    const w: number =
+      (renderer?.getWidth && renderer.getWidth()) || wrapper.clientWidth;
+    const h = wrapper.clientHeight;
+    const totalPx: number = wrapper.scrollWidth || wrapper.clientWidth || w;
+    const secToPx = (t: number) => (t * totalPx) / duration;
+    const pxToSec = (x: number) => (x * duration) / totalPx;
+    const scrollLeft: number =
+      (renderer?.getScroll && renderer.getScroll()) || 0;
     return {
       ws,
       wrapper,
@@ -799,12 +814,30 @@ export default function Page() {
       ctx.stroke();
     }
 
-    if (fadeInHandleRef.current)
-      fadeInHandleRef.current.style.left = `${secToPx(fadeIn) - scrollLeft}px`;
-    if (fadeOutHandleRef.current)
-      fadeOutHandleRef.current.style.left = `${
-        secToPx(duration - fadeOut) - scrollLeft
-      }px`;
+    if (fadeInHandleRef.current) {
+      const fiX = secToPx(fadeIn) - scrollLeft;
+      const visible = fiX >= -HANDLE_EDGE_PAD && fiX <= w + HANDLE_EDGE_PAD;
+      fadeInHandleRef.current.style.display = visible ? "block" : "none";
+      if (visible) {
+        fadeInHandleRef.current.style.left = `${clamp(
+          fiX,
+          HANDLE_EDGE_PAD,
+          w - HANDLE_EDGE_PAD,
+        )}px`;
+      }
+    }
+    if (fadeOutHandleRef.current) {
+      const foX = secToPx(duration - fadeOut) - scrollLeft;
+      const visible = foX >= -HANDLE_EDGE_PAD && foX <= w + HANDLE_EDGE_PAD;
+      fadeOutHandleRef.current.style.display = visible ? "block" : "none";
+      if (visible) {
+        fadeOutHandleRef.current.style.left = `${clamp(
+          foX,
+          HANDLE_EDGE_PAD,
+          w - HANDLE_EDGE_PAD,
+        )}px`;
+      }
+    }
 
     if (!showGridRef.current) return;
 
@@ -915,35 +948,29 @@ export default function Page() {
   /* -------- Mouse wheel zoom (cursor-anchored) -------- */
   const onWheelZoom = (e: React.WheelEvent) => {
     e.preventDefault(); // stop page scroll while hovering
-    const ws = wsRef.current;
+    const ws = wsRef.current as any;
     if (!ws) return;
-    const { renderer, wrapper } = getWrapperAndRenderer();
-    if (!wrapper) return;
-    const duration = ws.getDuration() || 0;
-    if (!duration) return;
+    const before = computeLayout();
+    if (!before) return;
 
-    const rect = wrapper.getBoundingClientRect();
+    const rect = before.wrapper.getBoundingClientRect();
     const x = e.clientX - rect.left;
-
-    const totalPxBefore =
-      renderer?.getWidth?.() || wrapper.scrollWidth || rect.width;
-    const pxPerSecBefore = totalPxBefore / duration;
-    const tUnderCursor = (wrapper.scrollLeft + x) / pxPerSecBefore;
+    const tUnderCursor = before.pxToSec(x);
 
     const factor = Math.pow(1.0015, -e.deltaY); // up→in, down→out
     const next = clamp(zoomRef.current * factor, 10, 2000);
     setZoom(next);
 
     requestAnimationFrame(() => {
-      const totalPxAfter =
-        renderer?.getWidth?.() || wrapper.scrollWidth || rect.width;
-      const pxPerSecAfter = totalPxAfter / duration;
-      const newScrollLeft = tUnderCursor * pxPerSecAfter - x;
-      wrapper.scrollLeft = clamp(
+      const after = computeLayout();
+      if (!after) return;
+      const newScrollLeft = after.secToPx(tUnderCursor) - x;
+      const clamped = clamp(
         newScrollLeft,
         0,
-        Math.max(0, totalPxAfter - wrapper.clientWidth),
+        Math.max(0, after.totalPx - after.w),
       );
+      (ws.renderer as any)?.setScroll?.(clamped);
       updateLoopFreeze();
       drawGrid();
     });
@@ -1006,26 +1033,28 @@ export default function Page() {
               display: "block",
             }}
           />
-          <div
-            ref={fadeInHandleRef}
-            style={styles.fadeHandle}
-            onPointerDown={startFadeDrag("in")}
-            title="Drag to set fade-in length"
-          >
-            <div style={styles.fadeHandleGrip} />
+          <div ref={fadeInHandleRef} style={styles.fadeHandle}>
+            <div
+              style={styles.fadeHandleGripZone}
+              onPointerDown={startFadeDrag("in")}
+              title="Drag to set fade-in length"
+            >
+              <div style={styles.fadeHandleGrip} />
+            </div>
           </div>
-          <div
-            ref={fadeOutHandleRef}
-            style={styles.fadeHandle}
-            onPointerDown={startFadeDrag("out")}
-            title="Drag to set fade-out length"
-          >
-            <div style={styles.fadeHandleGrip} />
+          <div ref={fadeOutHandleRef} style={styles.fadeHandle}>
+            <div
+              style={styles.fadeHandleGripZone}
+              onPointerDown={startFadeDrag("out")}
+              title="Drag to set fade-out length"
+            >
+              <div style={styles.fadeHandleGrip} />
+            </div>
           </div>
         </div>
 
         <section style={styles.controls}>
-          {/* Transport */}
+          {/* Transport — always visible */}
           <div style={styles.row}>
             <div style={styles.group}>
               <button
@@ -1066,13 +1095,25 @@ export default function Page() {
               >
                 ↦ To Loop Start
               </button>
+            </div>
+          </div>
 
+          <div style={{ ...styles.row, marginTop: 8 }}>
+            <div style={styles.group}>
               <button
                 style={styles.green}
                 onClick={exportSelection}
                 disabled={!regionRef.current || !bufferRef.current}
               >
-                Export WAV (Clean)
+                Export Selection
+              </button>
+
+              <button
+                style={styles.green}
+                onClick={exportAll}
+                disabled={!bufferRef.current}
+              >
+                Export All
               </button>
 
               <button
@@ -1091,265 +1132,334 @@ export default function Page() {
                 ↩ Undo (Ctrl+Z)
               </button>
             </div>
-          </div>
 
-          {/* BPM detect + controls */}
-          <div style={{ ...styles.row, marginTop: 10 }}>
-            <div className="detect" style={styles.inline}>
-              <button
-                style={styles.ghost}
-                onClick={async () => {
-                  if (!bufferRef.current) return;
-                  setIsDetecting(true);
-                  try {
-                    const res = await detectBPM(bufferRef.current, {
-                      minBPM: 60,
-                      maxBPM: 220,
-                    });
-                    setDetectedBpm(res.bpm);
-                    setDetectedPhase(res.phaseSec);
-                  } finally {
-                    setIsDetecting(false);
-                  }
-                }}
-                disabled={!bufferRef.current || isDetecting}
-              >
-                {isDetecting ? "Detecting…" : "Detect BPM"}
-              </button>
-              <button
-                style={styles.ghost}
-                onClick={() => {
-                  if (detectedBpm) setBpm(Math.round(detectedBpm));
-                }}
-                disabled={!detectedBpm}
-                title={
-                  detectedPhase != null
-                    ? `Phase ~${detectedPhase.toFixed(2)}s`
-                    : undefined
-                }
-              >
-                Use detected BPM
-                {detectedBpm ? ` (${Math.round(detectedBpm)})` : ""}
-              </button>
-            </div>
-
-            <div style={styles.inline}>
-              <label style={styles.label}>BPM</label>
-              <input
-                type="number"
-                min={40}
-                max={300}
-                step={1}
-                value={bpm}
-                onChange={(e) =>
-                  setBpm(clampNum(parseInt(e.target.value || "0", 10), 40, 300))
-                }
-                style={styles.input}
-              />
-            </div>
-            <div style={styles.inline}>
-              <label style={styles.label}>Snap</label>
-              <select
-                value={subdiv}
-                onChange={(e) => setSubdiv(e.target.value as Subdiv)}
-                style={styles.select}
-              >
-                <option value="bar">Bar</option>
-                <option value="beat">Beat</option>
-                <option value="eighth">1/8</option>
-                <option value="sixteenth">1/16</option>
-              </select>
-              <label style={styles.checkbox}>
-                <input
-                  type="checkbox"
-                  checked={snapEnabled}
-                  onChange={(e) => setSnapEnabled(e.target.checked)}
-                />
-                <span>Enabled</span>
-              </label>
-              <label style={{ ...styles.checkbox, marginLeft: 12 }}>
-                <input
-                  type="checkbox"
-                  checked={showGrid}
-                  onChange={(e) => setShowGrid(e.target.checked)}
-                />
-                <span>Show grid</span>
-              </label>
-            </div>
-          </div>
-
-          {/* FX row */}
-          <div style={{ ...styles.row, marginTop: 10 }}>
-            <div style={{ ...styles.inline, gap: 10, flexWrap: "wrap" }}>
-              <label style={styles.checkbox}>
-                <input
-                  type="checkbox"
-                  checked={fxHighpass}
-                  onChange={(e) => setFxHighpass(e.target.checked)}
-                />{" "}
-                <span>HPF 40 Hz</span>
-              </label>
-              <div style={styles.inline}>
-                <label style={styles.checkbox}>
-                  <input
-                    type="checkbox"
-                    checked={fxHum}
-                    onChange={(e) => setFxHum(e.target.checked)}
-                  />
-                  <span>Hum notch</span>
-                </label>
-                <select
-                  disabled={!fxHum}
-                  value={fxHumFreq}
-                  onChange={(e) =>
-                    setFxHumFreq(Number(e.target.value) as 50 | 60)
-                  }
-                  style={styles.select}
-                >
-                  <option value={60}>60 Hz</option>
-                  <option value={50}>50 Hz</option>
-                </select>
-              </div>
-              <label style={styles.checkbox}>
-                <input
-                  type="checkbox"
-                  checked={fxLowpass}
-                  onChange={(e) => setFxLowpass(e.target.checked)}
-                />{" "}
-                <span>LPF 16 kHz</span>
-              </label>
-              <label style={styles.checkbox}>
-                <input
-                  type="checkbox"
-                  checked={fxGate}
-                  onChange={(e) => setFxGate(e.target.checked)}
-                />{" "}
-                <span>Light Gate</span>
-              </label>
-              <label style={styles.checkbox}>
-                <input
-                  type="checkbox"
-                  checked={fxLimiter}
-                  onChange={(e) => setFxLimiter(e.target.checked)}
-                />{" "}
-                <span>Limiter</span>
-              </label>
-              <button style={styles.ghost} onClick={resetFilters}>
-                Reset filters
-              </button>
-            </div>
-          </div>
-
-          {/* Nudges + Readout */}
-          <div style={{ ...styles.row, marginTop: 10 }}>
-            <div style={styles.nudgeCol}>
-              <div style={styles.nudgeLabel}>Start</div>
-              <div style={styles.nudges}>
-                <button style={styles.chip} onClick={() => nudgeStart(-10)}>
-                  −10 ms
-                </button>
-                <button style={styles.chip} onClick={() => nudgeStart(-1)}>
-                  −1 ms
-                </button>
-                <button style={styles.chip} onClick={() => nudgeStart(+1)}>
-                  +1 ms
-                </button>
-                <button style={styles.chip} onClick={() => nudgeStart(+10)}>
-                  +10 ms
-                </button>
-              </div>
-            </div>
-            <div style={styles.nudgeCol}>
-              <div style={styles.nudgeLabel}>End</div>
-              <div style={styles.nudges}>
-                <button style={styles.chip} onClick={() => nudgeEnd(-10)}>
-                  −10 ms
-                </button>
-                <button style={styles.chip} onClick={() => nudgeEnd(-1)}>
-                  −1 ms
-                </button>
-                <button style={styles.chip} onClick={() => nudgeEnd(+1)}>
-                  +1 ms
-                </button>
-                <button style={styles.chip} onClick={() => nudgeEnd(+10)}>
-                  +10 ms
-                </button>
-              </div>
-            </div>
             <div style={styles.meta}>
               Selection: <strong>{fmt(start)}</strong> –{" "}
               <strong>{fmt(end)}</strong> ({fmt(end - start)})
             </div>
           </div>
 
-          {/* Export helpers */}
-          <div style={{ ...styles.row, marginTop: 6 }}>
-            <label style={styles.checkbox}>
-              <input
-                type="checkbox"
-                checked={zeroCross}
-                onChange={(e) => setZeroCross(e.target.checked)}
-              />{" "}
-              <span>Snap to zero-cross (export)</span>
-            </label>
-            <label style={styles.checkbox}>
-              <input
-                type="checkbox"
-                checked={edgeFade}
-                onChange={(e) => setEdgeFade(e.target.checked)}
-              />{" "}
-              <span>Edge fades (export)</span>
-            </label>
+          {/* Tabbed panel — everything else lives here to keep the UI minimal */}
+          <div style={styles.tabBar}>
+            <button
+              style={activeTab === "bpm" ? styles.tabActive : styles.tab}
+              onClick={() => setActiveTab("bpm")}
+            >
+              BPM
+            </button>
+            <button
+              style={activeTab === "fade" ? styles.tabActive : styles.tab}
+              onClick={() => setActiveTab("fade")}
+            >
+              FADE
+            </button>
+            <button
+              style={activeTab === "filter" ? styles.tabActive : styles.tab}
+              onClick={() => setActiveTab("filter")}
+            >
+              FILTER
+            </button>
+            <button
+              style={activeTab === "trim" ? styles.tabActive : styles.tab}
+              onClick={() => setActiveTab("trim")}
+            >
+              TRIM
+            </button>
           </div>
 
-          {/* Fade in/out */}
-          <div style={{ ...styles.row, marginTop: 10 }}>
-            <div style={styles.nudgeCol}>
-              <div style={styles.nudgeLabel}>Fade In</div>
-              <div style={styles.nudges}>
-                <button style={styles.chip} onClick={() => nudgeFadeIn(-100)}>
-                  −100 ms
+          {activeTab === "bpm" && (
+            <div style={styles.tabPanel}>
+              {/* BPM detect + controls */}
+              <div style={styles.row}>
+                <div className="detect" style={styles.inline}>
+                  <button
+                    style={styles.ghost}
+                    onClick={async () => {
+                      if (!bufferRef.current) return;
+                      setIsDetecting(true);
+                      try {
+                        const res = await detectBPM(bufferRef.current, {
+                          minBPM: 60,
+                          maxBPM: 220,
+                        });
+                        setDetectedBpm(res.bpm);
+                        setDetectedPhase(res.phaseSec);
+                      } finally {
+                        setIsDetecting(false);
+                      }
+                    }}
+                    disabled={!bufferRef.current || isDetecting}
+                  >
+                    {isDetecting ? "Detecting…" : "Detect BPM"}
+                  </button>
+                  <button
+                    style={styles.ghost}
+                    onClick={() => {
+                      if (detectedBpm) setBpm(Math.round(detectedBpm));
+                    }}
+                    disabled={!detectedBpm}
+                    title={
+                      detectedPhase != null
+                        ? `Phase ~${detectedPhase.toFixed(2)}s`
+                        : undefined
+                    }
+                  >
+                    Use detected BPM
+                    {detectedBpm ? ` (${Math.round(detectedBpm)})` : ""}
+                  </button>
+                </div>
+
+                <div style={styles.inline}>
+                  <label style={styles.label}>BPM</label>
+                  <input
+                    type="number"
+                    min={40}
+                    max={300}
+                    step={1}
+                    value={bpm}
+                    onChange={(e) =>
+                      setBpm(
+                        clampNum(parseInt(e.target.value || "0", 10), 40, 300),
+                      )
+                    }
+                    style={styles.input}
+                  />
+                </div>
+                <div style={styles.inline}>
+                  <label style={styles.label}>Snap</label>
+                  <select
+                    value={subdiv}
+                    onChange={(e) => setSubdiv(e.target.value as Subdiv)}
+                    style={styles.select}
+                  >
+                    <option value="bar">Bar</option>
+                    <option value="beat">Beat</option>
+                    <option value="eighth">1/8</option>
+                    <option value="sixteenth">1/16</option>
+                  </select>
+                  <label style={styles.checkbox}>
+                    <input
+                      type="checkbox"
+                      checked={snapEnabled}
+                      onChange={(e) => setSnapEnabled(e.target.checked)}
+                    />
+                    <span>Enabled</span>
+                  </label>
+                  <label style={{ ...styles.checkbox, marginLeft: 12 }}>
+                    <input
+                      type="checkbox"
+                      checked={showGrid}
+                      onChange={(e) => setShowGrid(e.target.checked)}
+                    />
+                    <span>Show grid</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === "fade" && (
+            <div style={styles.tabPanel}>
+              {/* Fade in/out */}
+              <div style={styles.row}>
+                <div style={styles.nudgeCol}>
+                  <div style={styles.nudgeLabel}>Fade In</div>
+                  <div style={styles.nudges}>
+                    <button
+                      style={styles.chip}
+                      onClick={() => nudgeFadeIn(-100)}
+                    >
+                      −100 ms
+                    </button>
+                    <button
+                      style={styles.chip}
+                      onClick={() => nudgeFadeIn(-10)}
+                    >
+                      −10 ms
+                    </button>
+                    <button
+                      style={styles.chip}
+                      onClick={() => nudgeFadeIn(+10)}
+                    >
+                      +10 ms
+                    </button>
+                    <button
+                      style={styles.chip}
+                      onClick={() => nudgeFadeIn(+100)}
+                    >
+                      +100 ms
+                    </button>
+                  </div>
+                </div>
+                <div style={styles.nudgeCol}>
+                  <div style={styles.nudgeLabel}>Fade Out</div>
+                  <div style={styles.nudges}>
+                    <button
+                      style={styles.chip}
+                      onClick={() => nudgeFadeOut(-100)}
+                    >
+                      −100 ms
+                    </button>
+                    <button
+                      style={styles.chip}
+                      onClick={() => nudgeFadeOut(-10)}
+                    >
+                      −10 ms
+                    </button>
+                    <button
+                      style={styles.chip}
+                      onClick={() => nudgeFadeOut(+10)}
+                    >
+                      +10 ms
+                    </button>
+                    <button
+                      style={styles.chip}
+                      onClick={() => nudgeFadeOut(+100)}
+                    >
+                      +100 ms
+                    </button>
+                  </div>
+                </div>
+                <button
+                  style={styles.ghost}
+                  onClick={clearFades}
+                  disabled={fadeInSec === 0 && fadeOutSec === 0}
+                >
+                  Clear fades
                 </button>
-                <button style={styles.chip} onClick={() => nudgeFadeIn(-10)}>
-                  −10 ms
-                </button>
-                <button style={styles.chip} onClick={() => nudgeFadeIn(+10)}>
-                  +10 ms
-                </button>
-                <button style={styles.chip} onClick={() => nudgeFadeIn(+100)}>
-                  +100 ms
+                <div style={styles.meta}>
+                  Fade in <strong>{fmt(fadeInSec)}</strong> · Fade out{" "}
+                  <strong>{fmt(fadeOutSec)}</strong>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === "filter" && (
+            <div style={styles.tabPanel}>
+              {/* FX row */}
+              <div style={{ ...styles.row, ...styles.inline, gap: 10 }}>
+                <label style={styles.checkbox}>
+                  <input
+                    type="checkbox"
+                    checked={fxHighpass}
+                    onChange={(e) => setFxHighpass(e.target.checked)}
+                  />{" "}
+                  <span>HPF 40 Hz</span>
+                </label>
+                <div style={styles.inline}>
+                  <label style={styles.checkbox}>
+                    <input
+                      type="checkbox"
+                      checked={fxHum}
+                      onChange={(e) => setFxHum(e.target.checked)}
+                    />
+                    <span>Hum notch</span>
+                  </label>
+                  <select
+                    disabled={!fxHum}
+                    value={fxHumFreq}
+                    onChange={(e) =>
+                      setFxHumFreq(Number(e.target.value) as 50 | 60)
+                    }
+                    style={styles.select}
+                  >
+                    <option value={60}>60 Hz</option>
+                    <option value={50}>50 Hz</option>
+                  </select>
+                </div>
+                <label style={styles.checkbox}>
+                  <input
+                    type="checkbox"
+                    checked={fxLowpass}
+                    onChange={(e) => setFxLowpass(e.target.checked)}
+                  />{" "}
+                  <span>LPF 16 kHz</span>
+                </label>
+                <label style={styles.checkbox}>
+                  <input
+                    type="checkbox"
+                    checked={fxGate}
+                    onChange={(e) => setFxGate(e.target.checked)}
+                  />{" "}
+                  <span>Light Gate</span>
+                </label>
+                <label style={styles.checkbox}>
+                  <input
+                    type="checkbox"
+                    checked={fxLimiter}
+                    onChange={(e) => setFxLimiter(e.target.checked)}
+                  />{" "}
+                  <span>Limiter</span>
+                </label>
+                <button style={styles.ghost} onClick={resetFilters}>
+                  Reset filters
                 </button>
               </div>
             </div>
-            <div style={styles.nudgeCol}>
-              <div style={styles.nudgeLabel}>Fade Out</div>
-              <div style={styles.nudges}>
-                <button style={styles.chip} onClick={() => nudgeFadeOut(-100)}>
-                  −100 ms
-                </button>
-                <button style={styles.chip} onClick={() => nudgeFadeOut(-10)}>
-                  −10 ms
-                </button>
-                <button style={styles.chip} onClick={() => nudgeFadeOut(+10)}>
-                  +10 ms
-                </button>
-                <button style={styles.chip} onClick={() => nudgeFadeOut(+100)}>
-                  +100 ms
-                </button>
+          )}
+
+          {activeTab === "trim" && (
+            <div style={styles.tabPanel}>
+              {/* Nudges */}
+              <div style={styles.row}>
+                <div style={styles.nudgeCol}>
+                  <div style={styles.nudgeLabel}>Start</div>
+                  <div style={styles.nudges}>
+                    <button style={styles.chip} onClick={() => nudgeStart(-10)}>
+                      −10 ms
+                    </button>
+                    <button style={styles.chip} onClick={() => nudgeStart(-1)}>
+                      −1 ms
+                    </button>
+                    <button style={styles.chip} onClick={() => nudgeStart(+1)}>
+                      +1 ms
+                    </button>
+                    <button style={styles.chip} onClick={() => nudgeStart(+10)}>
+                      +10 ms
+                    </button>
+                  </div>
+                </div>
+                <div style={styles.nudgeCol}>
+                  <div style={styles.nudgeLabel}>End</div>
+                  <div style={styles.nudges}>
+                    <button style={styles.chip} onClick={() => nudgeEnd(-10)}>
+                      −10 ms
+                    </button>
+                    <button style={styles.chip} onClick={() => nudgeEnd(-1)}>
+                      −1 ms
+                    </button>
+                    <button style={styles.chip} onClick={() => nudgeEnd(+1)}>
+                      +1 ms
+                    </button>
+                    <button style={styles.chip} onClick={() => nudgeEnd(+10)}>
+                      +10 ms
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Export helpers */}
+              <div style={{ ...styles.row, marginTop: 10 }}>
+                <label style={styles.checkbox}>
+                  <input
+                    type="checkbox"
+                    checked={zeroCross}
+                    onChange={(e) => setZeroCross(e.target.checked)}
+                  />{" "}
+                  <span>Snap to zero-cross (export selection)</span>
+                </label>
+                <label style={styles.checkbox}>
+                  <input
+                    type="checkbox"
+                    checked={edgeFade}
+                    onChange={(e) => setEdgeFade(e.target.checked)}
+                  />{" "}
+                  <span>Edge fades (export)</span>
+                </label>
               </div>
             </div>
-            <button
-              style={styles.ghost}
-              onClick={clearFades}
-              disabled={fadeInSec === 0 && fadeOutSec === 0}
-            >
-              Clear fades
-            </button>
-            <div style={styles.meta}>
-              Fade in <strong>{fmt(fadeInSec)}</strong> · Fade out{" "}
-              <strong>{fmt(fadeOutSec)}</strong>
-            </div>
-          </div>
+          )}
         </section>
       </div>
     </main>
@@ -1488,26 +1598,76 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
   },
   meta: { marginLeft: "auto", fontSize: 12, opacity: 0.85 },
+  tabBar: {
+    display: "flex",
+    gap: 4,
+    marginTop: 14,
+    borderBottom: "1px solid rgba(255,255,255,0.12)",
+    paddingBottom: 0,
+  },
+  tab: {
+    padding: "8px 16px",
+    borderRadius: "8px 8px 0 0",
+    background: "transparent",
+    color: "rgba(255,255,255,0.6)",
+    fontWeight: 700,
+    fontSize: 12,
+    letterSpacing: 0.5,
+    border: "none",
+    borderBottom: "2px solid transparent",
+    cursor: "pointer",
+  },
+  tabActive: {
+    padding: "8px 16px",
+    borderRadius: "8px 8px 0 0",
+    background: "rgba(255,255,255,0.08)",
+    color: "#fff",
+    fontWeight: 700,
+    fontSize: 12,
+    letterSpacing: 0.5,
+    border: "none",
+    borderBottom: "2px solid #4c8ff7",
+    cursor: "pointer",
+  },
+  tabPanel: {
+    background: "rgba(255,255,255,0.03)",
+    border: "1px solid rgba(255,255,255,0.1)",
+    borderTop: "none",
+    borderRadius: "0 0 12px 12px",
+    padding: 14,
+  },
   fadeHandle: {
     position: "absolute",
     top: 0,
     bottom: 0,
     width: 0,
     borderLeft: "2px dashed #ffd166",
+    // Purely a visual guide line — the small grip zone below is what's draggable,
+    // so clicks anywhere else on the waveform still reach the region/selection.
+    pointerEvents: "none",
+    zIndex: 15,
+  },
+  fadeHandleGripZone: {
+    position: "absolute",
+    top: -2,
+    left: -10,
+    width: 20,
+    height: 22,
     cursor: "ew-resize",
-    zIndex: 5,
+    pointerEvents: "auto",
+    zIndex: 20,
     touchAction: "none",
   },
   fadeHandleGrip: {
     position: "absolute",
-    top: -2,
-    left: -8,
+    top: 0,
+    left: 2,
     width: 16,
     height: 16,
     borderRadius: "50%",
     background: "#ffd166",
     border: "2px solid #0b1220",
-    cursor: "ew-resize",
+    pointerEvents: "none",
   },
 };
 
